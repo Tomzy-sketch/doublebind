@@ -81,4 +81,4 @@ docs/PRD_v2.md        the full PRD
 ## Next
 
 Day 2 adds ESM-2 plausibility scores for every reachable variant (run on a Kaggle GPU) and the three baselines.
-Send the output of `verify` and `variants` and the next piece gets built on top of it.
+
