@@ -307,12 +307,37 @@ class Check:
     detail: str
 
 
-def _pdb_title(path: Path) -> str:
-    text = path.read_text(encoding="utf-8", errors="replace")[:20000]
-    m = re.search(r"_struct\.title\s+(?:'([^']*)'|\"([^\"]*)\"|;\s*(.*?)\s*\n;|(\S+))", text, re.DOTALL)
-    if not m:
-        return "(title not parsed)"
-    return " ".join(next(g for g in m.groups() if g).split())
+def _unquote(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "'\"":
+        s = s[1:-1]
+    return " ".join(s.split())
+
+
+def pdb_title(path: Path) -> str:
+    """Read _struct.title from an mmCIF file, line by line (the title can sit far down the file)."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if not line.startswith("_struct.title"):
+                    continue
+                rest = line[len("_struct.title"):].strip()
+                if rest:
+                    return _unquote(rest)
+                nxt = next(f, "").rstrip("\n")
+                if nxt.startswith(";"):
+                    parts = [nxt[1:].strip()]
+                    for more in f:
+                        if more.startswith(";"):
+                            break
+                        parts.append(more.strip())
+                    return " ".join(p for p in parts if p)
+                return _unquote(nxt.strip())
+    except OSError:
+        pass
+    return "(title not found)"
+
+
+_pdb_title = pdb_title  # old name, kept for older tests
 
 
 def verify_all(keys, raw_dir) -> list[Check]:
@@ -354,7 +379,7 @@ def verify_all(keys, raw_dir) -> list[Check]:
         for pdb in t.pdb_ids:
             p = raw_dir / "pdb" / f"{pdb.upper()}.cif"
             checks.append(Check(f"{t.key}: structure {pdb}", "PASS" if p.exists() else "FAIL",
-                                _pdb_title(p) if p.exists() else "missing: check the title matches what you expect"))
+                                pdb_title(p) if p.exists() else "missing: check the title matches what you expect"))
         acts = raw_dir / "chembl" / f"{t.key}_activities.jsonl"
         if acts.exists():
             n = sum(1 for _ in open(acts, encoding="utf-8"))

@@ -1,3 +1,5 @@
 # Same as: pip install -e ".[dev]"   (use this file on Kaggle or Colab)
 requests>=2.31
 pytest>=7.4
+numpy>=1.24
+biopython>=1.83
