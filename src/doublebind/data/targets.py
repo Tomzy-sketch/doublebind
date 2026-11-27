@@ -19,6 +19,10 @@ class Target:
     genome_accession: str   # nucleotide record that contains the coding sequence
     pdb_ids: tuple
     notes: str = ""
+    # Day 3: structure used for folding-stability predictions. 'alphafold' = full-length AlphaFold DB model,
+    # 'pdb:XXXX' = an experimental structure. stability_region limits the coverage check to the folded chain.
+    stability_source: str = "alphafold"
+    stability_region: tuple | None = None
 
 
 TARGETS: dict[str, Target] = {
@@ -38,7 +42,8 @@ TARGETS: dict[str, Target] = {
         organism="Escherichia coli plasmid (pBR322 / Tn3 lineage)", uniprot="P62593", expected_length=286,
         genome_accession="J01749.1", pdb_ids=("1BTL",),
         notes="Literature numbering for TEM-1 is Ambler numbering, which differs from UniProt numbering "
-              "by a constant offset for most residues. The variants command finds that offset for you."),
+              "by a constant offset for most residues. The variants command finds that offset for you.",
+        stability_source="pdb:1BTL", stability_region=(24, 286)),
 }
 
 

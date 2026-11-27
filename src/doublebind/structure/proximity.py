@@ -44,7 +44,9 @@ def load_structure(path):
 
 
 def first_model(structure):
-    return next(structure.get_models())
+    for model in structure.get_models():
+        return model
+    raise ValueError("the structure file contains no atoms")
 
 
 @dataclass

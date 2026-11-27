@@ -30,6 +30,8 @@ RCSB = "https://files.rcsb.org/download"
 CHEMBL_HOST = "https://www.ebi.ac.uk"
 CHEMBL_API = CHEMBL_HOST + "/chembl/api/data"
 CARD_URL = "https://card.mcmaster.ca/latest/data"
+ALPHAFOLD_API = "https://alphafold.ebi.ac.uk/api/prediction"
+ALPHAFOLD_FILES = "https://alphafold.ebi.ac.uk/files"
 
 
 def http_get(url, params=None, timeout=180, retries=4, backoff=3.0):
@@ -178,6 +180,68 @@ def fetch_pdb(pdb_id: str, raw_dir: Path, manifest: Manifest, force=False) -> Pa
     return dest
 
 
+def fetch_alphafold(target: Target, raw_dir: Path, manifest: Manifest, force=False) -> Path:
+    """Full-length AlphaFold DB model (CC BY 4.0) saved as AF-<accession>-F1.pdb.
+
+    Asks the AlphaFold DB API for the current file URL, and falls back to the usual file names.
+    If everything fails, download the PDB file from https://alphafold.ebi.ac.uk/entry/<accession>
+    and save it under that name in data/raw/alphafold/.
+    """
+    acc = target.uniprot
+    dest = raw_dir / "alphafold" / f"AF-{acc}-F1.pdb"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    source = f"{ALPHAFOLD_API}/{acc}"
+    if not dest.exists() or force:
+        candidates = []
+        try:
+            data = http_get(f"{ALPHAFOLD_API}/{acc}").json()
+            entry = data[0] if isinstance(data, list) else data
+            if entry.get("pdbUrl"):
+                candidates.append(entry["pdbUrl"])
+        except Exception:
+            pass  # fall back to the usual file names below
+        candidates += [f"{ALPHAFOLD_FILES}/AF-{acc}-F1-model_v{v}.pdb" for v in (6, 5, 4)]
+        content, last = None, None
+        for url in candidates:
+            try:
+                content = http_get(url).content
+                source = url
+                break
+            except Exception as e:
+                last = e
+        if content is None:
+            raise RuntimeError(f"could not download the AlphaFold model for {acc} (last error: {last}). "
+                               f"Download it by hand from https://alphafold.ebi.ac.uk/entry/{acc} "
+                               f"and save it as {dest}")
+        dest.write_bytes(content)
+    _ensure_recorded(manifest, dest, source)
+    return dest
+
+
+_AA3 = {"ALA": "A", "ARG": "R", "ASN": "N", "ASP": "D", "CYS": "C", "GLN": "Q", "GLU": "E", "GLY": "G", "HIS": "H",
+        "ILE": "I", "LEU": "L", "LYS": "K", "MET": "M", "PHE": "F", "PRO": "P", "SER": "S", "THR": "T", "TRP": "W",
+        "TYR": "Y", "VAL": "V"}
+
+
+def pdb_ca_sequence(path: Path) -> str:
+    """Sequence of the first chain, read from the CA atoms of a PDB-format file (no Biopython needed)."""
+    seq, seen, chain = [], set(), None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            if not line.startswith("ATOM") or line[12:16].strip() != "CA":
+                continue
+            ch = line[21]
+            chain = chain or ch
+            if ch != chain:
+                break
+            key = (line[22:26], line[26])
+            if key in seen:
+                continue
+            seen.add(key)
+            seq.append(_AA3.get(line[17:20].strip(), "X"))
+    return "".join(seq)
+
+
 def chembl_pages(path: str, params=None):
     """Yield each JSON page of a ChEMBL list endpoint, following page_meta.next."""
     url = f"{CHEMBL_API}/{path}.json"
@@ -256,7 +320,7 @@ def fetch_card(raw_dir: Path, manifest: Manifest, force=False, log=print) -> Pat
     return dest
 
 
-def fetch_all(keys, raw_dir, chembl=True, card=False, force=False, log=print) -> list[tuple[str, str]]:
+def fetch_all(keys, raw_dir, chembl=True, card=False, force=False, log=print, alphafold=False) -> list[tuple[str, str]]:
     """Run every download step; a failing step is reported at the end and does not stop the others."""
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -291,6 +355,11 @@ def fetch_all(keys, raw_dir, chembl=True, card=False, force=False, log=print) ->
             s = run(f"chembl {t.key}", lambda t=t: fetch_chembl(t, raw_dir, manifest, force))
             if s:
                 log(f"    {s}")
+    if alphafold:
+        for t in targets:
+            if t.stability_source == "alphafold":
+                log(f"[{t.key}] AlphaFold model for {t.uniprot}")
+                run(f"alphafold {t.key}", lambda t=t: fetch_alphafold(t, raw_dir, manifest, force))
     if card:
         run("card", lambda: fetch_card(raw_dir, manifest, force, log))
     log("finished: " + (f"{len(errors)} step(s) failed" if errors else "all steps ok")
@@ -380,6 +449,21 @@ def verify_all(keys, raw_dir) -> list[Check]:
             p = raw_dir / "pdb" / f"{pdb.upper()}.cif"
             checks.append(Check(f"{t.key}: structure {pdb}", "PASS" if p.exists() else "FAIL",
                                 pdb_title(p) if p.exists() else "missing: check the title matches what you expect"))
+        if t.stability_source == "alphafold":
+            af = raw_dir / "alphafold" / f"AF-{t.uniprot}-F1.pdb"
+            if not af.exists():
+                checks.append(Check(f"{t.key}: AlphaFold model", "WARN", "not downloaded (needed on Day 3): data --alphafold"))
+            else:
+                fa = raw_dir / "uniprot" / f"{t.uniprot}.fasta"
+                af_seq = pdb_ca_sequence(af)
+                if fa.exists():
+                    uni = parse_fasta(fa.read_text(encoding="utf-8"))[0][1]
+                    same = af_seq == uni
+                    checks.append(Check(f"{t.key}: AlphaFold model", "PASS" if same else "WARN",
+                                        f"{len(af_seq)} residues, " + ("sequence matches UniProt" if same else
+                                        f"sequence differs from UniProt ({len(uni)} residues): check the file")))
+                else:
+                    checks.append(Check(f"{t.key}: AlphaFold model", "PASS", f"{len(af_seq)} residues"))
         acts = raw_dir / "chembl" / f"{t.key}_activities.jsonl"
         if acts.exists():
             n = sum(1 for _ in open(acts, encoding="utf-8"))

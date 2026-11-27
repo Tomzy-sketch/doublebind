@@ -26,10 +26,12 @@ class Source:
 
 SOURCES: dict[str, Source] = {
     "doublebind": Source(Convention.DESTABILIZING_POSITIVE, True, "PRD v2.0 Section 19"),
-    "thermompnn": Source(Convention.DESTABILIZING_POSITIVE, False,
-                         "A third-party page documents 'negative = stabilizing'; confirm in the repository"),
+    "thermompnn": Source(Convention.DESTABILIZING_POSITIVE, True,
+                         "Checked 2026-11: its example output averages +1.7 for substitutions to proline and +0.5 to "
+                         "cysteine, and its code negates the Megascale ddG_ML labels so that positive = destabilizing"),
     "megascale": Source(Convention.STABILIZING_POSITIVE, False,
-                        "Believed to report unfolding free energy (positive = stabilizing); confirm in the dataset README"),
+                        "ThermoMPNN's code negates ddG_ML, which implies positive = stabilizing in the raw file; "
+                        "confirm in the Tsuboyama dataset README before using the raw file"),
     "foldx": Source(Convention.DESTABILIZING_POSITIVE, False, "Commonly reported this way; confirm"),
     "rosetta": Source(Convention.DESTABILIZING_POSITIVE, False, "Commonly reported this way; confirm"),
 }

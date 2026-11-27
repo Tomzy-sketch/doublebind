@@ -52,7 +52,8 @@ def _read_csv(path):
 
 def cmd_data(args) -> int:
     keys = [k.strip() for k in args.targets.split(",") if k.strip()]
-    errors = fetch_all(keys, args.raw_dir, chembl=not args.no_chembl, card=args.card, force=args.force)
+    errors = fetch_all(keys, args.raw_dir, chembl=not args.no_chembl, card=args.card, force=args.force,
+                       alphafold=args.alphafold)
     return 1 if errors else 0
 
 
@@ -314,16 +315,98 @@ def cmd_table(args) -> int:
     processed = Path(args.out_dir)
     esm_file = find_esm_file(processed, key, args.esm_file)
     pocket_file = processed / f"{key}_pocket.csv"
+    ddg_file = processed / f"{key}_ddg_fold.csv"
     esm_rows = read_rows(esm_file) if esm_file and Path(esm_file).exists() else None
     pocket_rows = read_rows(pocket_file) if pocket_file.exists() else None
-    rows = build_variant_table(aa, esm_rows, pocket_rows, cutoff=args.cutoff)
+    ddg_rows = read_rows(ddg_file) if ddg_file.exists() else None
+    rows = build_variant_table(aa, esm_rows, pocket_rows, cutoff=args.cutoff, ddg_rows=ddg_rows)
     out = processed / f"{key}_variant_table.csv"
     write_table(out, rows)
     with_esm = sum(1 for r in rows if r["esm_llr"] != "")
     with_pocket = sum(1 for r in rows if r["dist_min"] != "")
-    print(f"{key}: {len(rows)} variants; {with_esm} with an ESM score, {with_pocket} with a pocket distance")
+    with_ddg = sum(1 for r in rows if r["ddg_fold"] != "")
+    print(f"{key}: {len(rows)} variants; {with_esm} with an ESM score, {with_ddg} with a stability score, "
+          f"{with_pocket} with a pocket distance")
     print(f"wrote {out}")
     return 0
+
+
+# ---------- Day 3 ----------
+
+def cmd_stability_prep(args) -> int:
+    from doublebind.structure.prep import write_clean_pdb
+    from doublebind.structure.proximity import ChainInfo, map_chain_to_target
+
+    key = args.target
+    t = TARGETS[key]
+    protein = cds_to_protein(_load_cds(key, args.raw_dir, args.cds))
+    source = args.source or t.stability_source
+    if args.file:
+        path, label = Path(args.file), Path(args.file).stem
+    elif source == "alphafold":
+        path, label = Path(args.raw_dir) / "alphafold" / f"AF-{t.uniprot}-F1.pdb", f"AF-{t.uniprot}-F1"
+    elif source.startswith("pdb:"):
+        pdb_id = source.split(":", 1)[1]
+        path, label = _structure_path(args.raw_dir, pdb_id), pdb_id.upper()
+    else:
+        print(f"unknown source '{source}': use alphafold, pdb:XXXX or --file PATH")
+        return 1
+    if not path.exists():
+        hint = ("run: python -m doublebind data --alphafold --no-chembl" if source == "alphafold" and not args.file
+                else "check the path, or run the data command")
+        print(f"{path} not found: {hint}")
+        return 1
+    out_pdb = Path(args.out_dir) / "stability" / f"{key}_{label}_A.pdb"
+    prepared = write_clean_pdb(path, out_pdb, chain_id=args.chain)
+    seq = prepared.sequence
+    m = map_chain_to_target(ChainInfo("A", seq, list(range(len(seq)))), protein)
+    print(f"{key}: wrote {out_pdb}")
+    print(f"  {len(seq)} residues from chain {prepared.chain_id} of {label} ({prepared.n_skipped} skipped for missing backbone atoms)")
+    print(f"  aligned to the target: identity {m.identity:.2f}, covers {100 * m.coverage:.0f}% of the {len(protein)} target residues")
+    if m.identity < 0.9 or m.coverage < 0.5:
+        print("  WARNING: this structure is not a close, near-complete match to the target; stability scores "
+              "will be missing or less reliable where it does not cover the protein")
+    print(f"next: run ThermoMPNN on that file (recipe in README.md); it writes ThermoMPNN_inference_{out_pdb.stem}.csv")
+    print(f"then: python -m doublebind stability-import {key} --csv <that file>")
+    return 0
+
+
+def cmd_stability_import(args) -> int:
+    from doublebind.stability import (coverage, direction_report, format_summary, import_thermompnn,
+                                      proline_canary, read_thermompnn_csv, save_report)
+
+    key = args.target
+    t = TARGETS[key]
+    cds = _load_cds(key, args.raw_dir, args.cds)
+    protein = cds_to_protein(cds)
+    aa = aggregate_missense(enumerate_variants(cds))
+    out_dir = Path(args.out_dir)
+    map_path = Path(args.map) if args.map else None
+    if map_path is None:
+        found = sorted((out_dir / "stability").glob(f"{key}_*_A.map.json"))
+        if len(found) != 1:
+            print(f"found {len(found)} map files for {key} in {out_dir / 'stability'}: pass --map PATH to choose one")
+            return 1
+        map_path = found[0]
+    info = json.loads(map_path.read_text(encoding="utf-8"))
+    csv_rows = read_thermompnn_csv(args.csv)
+    imp = import_thermompnn(csv_rows, info["index_map"], protein, source=args.source, allow_mismatch=args.allow_mismatch)
+    cov = coverage(imp.rows, aa, t.stability_region)
+    canary = proline_canary(imp.rows)
+    directions = direction_report(imp.rows, protein, _load_known(Path(args.directions), key))
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_csv = out_dir / f"{key}_ddg_fold.csv"
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["pos", "wt_aa", "mut_aa", "ddg_fold", "source"])
+        for r in imp.rows:
+            w.writerow([r["pos"], r["wt_aa"], r["mut_aa"], f"{r['ddg_fold']:.4f}", args.source])
+    report = out_dir / f"{key}_stability_report.json"
+    save_report(report, key, imp, cov, canary, directions)
+    print(format_summary(key, Path(args.csv).name, imp, cov, canary, directions))
+    print(f"  wrote {out_csv} and {report}")
+    return 1 if canary["passed"] is False else 0
 
 
 # ---------- parser ----------
@@ -345,6 +428,7 @@ def build_parser() -> argparse.ArgumentParser:
     d.add_argument("--raw-dir", default="data/raw")
     d.add_argument("--no-chembl", action="store_true", help="skip ChEMBL (needed on Day 4, can wait)")
     d.add_argument("--card", action="store_true", help="also download CARD (academic use only)")
+    d.add_argument("--alphafold", action="store_true", help="also download AlphaFold DB models (Day 3, GyrA)")
     d.add_argument("--force", action="store_true", help="download again even if files exist")
     d.set_defaults(func=cmd_data)
 
@@ -401,6 +485,23 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--cutoff", type=float, default=8.0)
     common(t)
     t.set_defaults(func=cmd_table)
+    sp = sub.add_parser("stability-prep", help="write the ThermoMPNN input file for a target (Day 3)")
+    sp.add_argument("target", choices=sorted(TARGETS))
+    sp.add_argument("--source", default=None, help="alphafold or pdb:XXXX (default: set per target in targets.py)")
+    sp.add_argument("--file", default=None, help="use this structure file instead")
+    sp.add_argument("--chain", default=None, help="chain to use (default: the first protein chain)")
+    common(sp)
+    sp.set_defaults(func=cmd_stability_prep)
+
+    si = sub.add_parser("stability-import", help="read ThermoMPNN output and add it to the pipeline (Day 3)")
+    si.add_argument("target", choices=sorted(TARGETS))
+    si.add_argument("--csv", required=True, help="the ThermoMPNN_inference_*.csv file")
+    si.add_argument("--map", default=None, help="the .map.json written by stability-prep (default: the only one)")
+    si.add_argument("--source", default="thermompnn", help="sign convention of the file (see signs.py)")
+    si.add_argument("--allow-mismatch", action="store_true", help="keep rows where the structure residue differs from the target")
+    si.add_argument("--directions", default="data/known_directions.csv")
+    common(si)
+    si.set_defaults(func=cmd_stability_import)
     return p
 
 
